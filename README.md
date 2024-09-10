@@ -9,5 +9,6 @@
 2. TrOCR
 
 ### Data set 
-1. poloclub/diffusiondb-Text to image
-2. corto-ai/handwritten-text-Image to text
+1. poloclub/diffusiondb -->Text to image
+2. corto-ai/handwritten-text  --> Image to text
+3. vicgalle/alpaca-gpt4    --> Text generation

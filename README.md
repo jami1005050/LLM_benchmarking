@@ -28,12 +28,12 @@
 # Inference Setup:
 For each model, 50 input prompts are sampled to evaluate inference performance. We capture key metrics for each prompt, including:
 
- Latency: Time taken for inference completion per prompt.
- Energy Consumption: Energy used during the inference process.
+ Latency: Time taken for inference completion per prompt.< br / > 
+ Energy Consumption: Energy used during the inference process.< br / > 
  Carbon Emission: Carbon footprint associated with the energy consumed.
 
-## These metrics are collected across two distinct hardware configurations hosted on the Google Cloud Platform:
+### These metrics are collected across two distinct hardware configurations hosted on the Google Cloud Platform:
 
-L4 GPU
-A100 GPU
+L4 GPU< br / > 
+A100 GPU< br / > 
 The comparison of these two GPUs provides insights into the trade-offs in terms of speed (latency), energy efficiency, and environmental impact (carbon emissions) when deploying machine learning models on different hardware infrastructures.

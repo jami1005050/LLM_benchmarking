@@ -1,98 +1,89 @@
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from codecarbon import EmissionsTracker
-from datasets import load_dataset
-from torch.utils.data import DataLoader
+"""Benchmark harness for Llama-2-7B-chat text generation.
+
+Profiles meta-llama/Llama-2-7b-chat-hf on a sample of Alpaca-GPT4
+instructions, recording latency and energy consumption per prompt with
+CodeCarbon.
+"""
+
+import argparse
 import os
+
+import torch
 from tqdm import tqdm
-import numpy as np
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from utils.cli import add_common_bench_args, resolve_base_dir
+from utils.config import LLAMA
+from utils.data import load_sampled_dataset
+from utils.tracking import build_exp_id, inference_result_path, make_tracker
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def reformat_func(example, prompt_text=' '):
-
-    question = prompt_text + example['instruction']
-    if example.get('input', None) and example['input'].strip():
-        question += f'\n{example["input"]}'
-
-    return {'question': question}
+MAX_GENERATION_LENGTH = 1024
 
 
-class DataCollactorForLLM:
+def reformat_func(example, prompt_prefix=" "):
+    question = prompt_prefix + example["instruction"]
+    if example.get("input", None) and example["input"].strip():
+        question += f"\n{example['input']}"
+    return {"question": question}
+
+
+class DataCollatorForLLM:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
     def __call__(self, data):
         text_batch = [element["question"] for element in data]
-        tokenized = self.tokenizer(text_batch, padding='longest', truncation=False, return_tensors='pt')
+        return self.tokenizer(text_batch, padding="longest", truncation=False, return_tensors="pt")
 
-        return tokenized
 
-quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+def main(device_tag, num_samples, batch_size, exp_name, base_dir, hf_token):
+    exp_id = build_exp_id(exp_name, LLAMA.short_name, batch_size)
 
-def main(exp_name, batch_size, model_name, base_dir = "output"):
-
-    exp_id = exp_name + "_{}_batch_{}".format(model_name[11:], batch_size)
-
-    model_path = "pretrained"
-    dataset_path = "dataset"
-    user_token = '' # replace with your token
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name,token = user_token,
-                                              cache_dir=model_path, local_files_only=False)
-    #Jami
+    tokenizer = AutoTokenizer.from_pretrained(LLAMA.checkpoint, token=hf_token or None, cache_dir="pretrained")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_name,token = user_token, cache_dir=model_path,
-                                                 local_files_only=False,
-                                                 torch_dtype=torch.bfloat16,
-                                                #  quantization_config = quantization_config, # when quantization is present 
-                                                 device_map={"": 0})
-    # model = model.to("cuda") # commented as it does not work when use quantization
-
-    dataset = load_dataset("vicgalle/alpaca-gpt4", cache_dir=dataset_path)
-
-    column_names = dataset['train'].column_names
-    dataset_selected = dataset["train"].select(np.arange(50))
-
-    tokenized_dataset = dataset_selected.map(
-        lambda example: reformat_func(example),
-        batched=False,
-        remove_columns=column_names
+    model = AutoModelForCausalLM.from_pretrained(
+        LLAMA.checkpoint,
+        token=hf_token or None,
+        cache_dir="pretrained",
+        torch_dtype=torch.bfloat16,
+        device_map={"": 0},
     )
 
-    collate_tokenize = DataCollactorForLLM(tokenizer)
-
-    train_dataloader = DataLoader(
-        dataset=tokenized_dataset,
+    dataset = load_sampled_dataset(LLAMA.dataset, num_samples, reformat_func)
+    dataloader = DataLoader(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_tokenize
+        collate_fn=DataCollatorForLLM(tokenizer),
     )
 
-    input_list = []
-    output_list = []
+    inputs, outputs = [], []
+    for batch in tqdm(dataloader):
+        input_ids = batch["input_ids"].cuda()
+        with make_tracker(exp_id, base_dir, device_tag):
+            generated = model.generate(input_ids, max_length=MAX_GENERATION_LENGTH)
+        inputs.append(input_ids.to("cpu").detach())
+        outputs.append(generated.to("cpu").detach())
 
-    for index, item in enumerate(tqdm(train_dataloader)):
+    result = {"Input": inputs, "Output": outputs}
+    torch.save(result, inference_result_path(base_dir, device_tag, exp_id))
 
-        input_id = item["input_ids"].cuda()
-        with EmissionsTracker(project_name = exp_id, output_file = base_dir+"/emissions_L4_{}.csv".format(exp_id),log_level="error") as tracker:
-            outputs = model.generate(input_id, max_length = 1024)
-
-
-        input_list   += [input_id.to("cpu").detach()]
-        output_list  += [outputs.to("cpu").detach()]
-
-    restul_dict = {"Input": input_list, "Output": output_list}
-    torch.save(restul_dict, base_dir+"/inference_result_L4_{}.pth".format(exp_id))
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_common_bench_args(parser, default_exp_name=LLAMA.default_exp_name)
+    args = parser.parse_args()
 
-    exp_name   = "exp5"
-    model_name = "meta-llama/Llama-2-7b-chat-hf"
-    batch_size = 1
-    base_dir   = "output/exp5"
-    os.makedirs(base_dir, exist_ok=True)
-
-    main(exp_name, batch_size, model_name, base_dir=base_dir)
+    main(
+        device_tag=args.device_tag,
+        num_samples=args.num_samples,
+        batch_size=args.batch_size,
+        exp_name=args.exp_name,
+        base_dir=resolve_base_dir(args),
+        hf_token=args.hf_token,
+    )

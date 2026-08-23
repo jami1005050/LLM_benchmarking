@@ -1,114 +1,92 @@
-from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
-import torch
-from diffusers.utils import load_image, make_image_grid
-from PIL import Image
+"""Benchmark harness for ControlNet (Canny-edge-conditioned image generation).
+
+Profiles lllyasviel/sd-controlnet-canny, built on the Stable Diffusion v1.5
+base pipeline, on a sample of DiffusionDB prompts and their Canny-edge maps,
+recording latency and energy consumption per prompt with CodeCarbon.
+"""
+
+import argparse
+import os
+
 import cv2
 import numpy as np
-from codecarbon import EmissionsTracker
-from datasets import load_dataset
+import pandas as pd
+import torch
+from diffusers import ControlNetModel, StableDiffusionControlNetPipeline, UniPCMultistepScheduler
+from diffusers.utils import load_image
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import pandas as pd 
-import os 
+
+from utils.cli import add_common_bench_args, resolve_base_dir
+from utils.config import CONTROLNET, DIFFUSION_MODELS
+from utils.data import PromptImageCollate, load_sampled_dataset
+from utils.tracking import artifact_path, build_exp_id, make_tracker
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+CANNY_LOW_THRESHOLD = 100
+CANNY_HIGH_THRESHOLD = 200
+
+
 def reformat_func(example):
-
-    question = example['prompt']
-    original_image = load_image(example['image'])
-
-    image = np.array(original_image)
-
-    low_threshold = 100
-    high_threshold = 200
-
-    image = cv2.Canny(image, low_threshold, high_threshold)
-    image = image[:, :, None]
-    image = np.concatenate([image, image, image], axis=2)
-    canny_image = Image.fromarray(image)
-    return {'prompt': question,'image':canny_image}
+    original_image = load_image(example["image"])
+    edges = cv2.Canny(np.array(original_image), CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD)
+    edges = np.concatenate([edges[:, :, None]] * 3, axis=2)
+    return {"prompt": example["prompt"], "image": Image.fromarray(edges)}
 
 
-# Custom dataset class
-class DiffusionDBDataset():
-    def __init__(self):
-        pass
+def main(device_tag, num_samples, batch_size, exp_name, base_dir, hf_token):
+    exp_id = build_exp_id(exp_name, CONTROLNET.short_name, batch_size)
 
-    def __call__(self,data):
-        text_batch = [element["prompt"] for element in data]
-        image_batch = [element["image"] for element in data]
-        return text_batch,image_batch
-    
+    dataset = load_sampled_dataset(CONTROLNET.dataset, num_samples, reformat_func)
 
-
-def main(exp_name, batch_size, model_name, base_dir = "output"):
-    exp_id = exp_name + "_{}_batch_{}".format(model_name[11:], batch_size)
-    print(exp_id)
-    model_path = "pretrained"
-    dataset_path = "dataset"
-    dataset = load_dataset("poloclub/diffusiondb", cache_dir=dataset_path)
-    column_names = dataset['train'].column_names
-    HF_token = '' # YOUR TOKEN
-    dataset_selected = dataset["train"].select(np.arange(50))
-
-
-    # Use the DPMSolverMultistepScheduler (DPM-Solver++) scheduler here instead
-    controlnet = ControlNetModel.from_pretrained(model_name,
-                                                torch_dtype=torch.float16,
-                                                token = HF_token)
+    controlnet = ControlNetModel.from_pretrained(
+        CONTROLNET.checkpoint,
+        torch_dtype=torch.float16,
+        token=hf_token or None,
+    )
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5", controlnet=controlnet,
-        torch_dtype=torch.float16,token = HF_token,cache_dir=model_path
+        DIFFUSION_MODELS["sd15"].checkpoint,
+        controlnet=controlnet,
+        torch_dtype=torch.float16,
+        cache_dir="pretrained",
+        token=hf_token or None,
     )
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-
     pipe = pipe.to("cuda")
 
-    processed_dataset = dataset_selected.map(
-        lambda example: reformat_func(example),
-        batched=False,
-        remove_columns=column_names
-    )
-    train_dataset = DiffusionDBDataset()
-    # Create a dataloader
-
-    cuda_device = os.getenv("CUDA_VISIBLE_DEVICES")
-    print("CPU allocated : ", cuda_device)
-
-
-    train_dataloader = DataLoader(
-        dataset=processed_dataset,
+    dataloader = DataLoader(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=train_dataset
+        collate_fn=PromptImageCollate(),
     )
-    count = 0
-    prompt_list = []
-    image_list = []
-    for index, (prompts,images) in enumerate(tqdm(train_dataloader)):
-        # Generate images using Stable Diffusion Pipeline
-        prompt_list+= [prompts]
-        image_list+= [images]
-        with EmissionsTracker(project_name = exp_id, output_file = base_dir+"/emissions_A100{}.csv".format(exp_id), log_level="error", gpu_ids=cuda_device) as tracker:
-            generated_images = pipe(prompts,image=images).images
-        # generated_images.to("cpu").detach()
-        generated_images[0].save("control_netimage_"+str(count)+".png")
-        count+=1
 
-    prompt_list = pd.DataFrame({
-          'Prompt': prompt_list,
-          'Image': image_list
-      })
-    prompt_list.to_csv("control_net_prompt_list.csv")
+    prompt_log = []
+    count = 0
+    for prompts, images in tqdm(dataloader):
+        prompt_log += prompts
+        with make_tracker(exp_id, base_dir, device_tag):
+            generated_images = pipe(prompts, image=images).images
+        for image in generated_images:
+            image.save(artifact_path(base_dir, f"{CONTROLNET.key}_image_{count}.png", subdir="images"))
+            count += 1
+
+    prompt_csv = artifact_path(base_dir, f"{CONTROLNET.key}_prompt_list.csv")
+    pd.DataFrame({"Prompt": prompt_log}).to_csv(prompt_csv, index=False)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_common_bench_args(parser, default_exp_name=CONTROLNET.default_exp_name)
+    args = parser.parse_args()
 
-    exp_name   = "exGenImage"
-    model_name = "lllyasviel/sd-controlnet-canny"
-    batch_size = 1
-    base_dir   = "output/exGenImage"
-    os.makedirs(base_dir, exist_ok=True)
-
-    main(exp_name, batch_size, model_name, base_dir=base_dir)
+    main(
+        device_tag=args.device_tag,
+        num_samples=args.num_samples,
+        batch_size=args.batch_size,
+        exp_name=args.exp_name,
+        base_dir=resolve_base_dir(args),
+        hf_token=args.hf_token,
+    )

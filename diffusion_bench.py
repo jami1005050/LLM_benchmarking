@@ -1,89 +1,80 @@
+"""Benchmark harness for text-to-image / text-to-audio diffusion models.
 
+Profiles one of Stable Diffusion v1.5, Stable Diffusion v2.1, or Riffusion
+(selected with --model) on a sample of DiffusionDB prompts, recording
+latency and energy consumption per prompt with CodeCarbon.
+"""
+
+import argparse
+import os
+
+import pandas as pd
 import torch
 from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
-from codecarbon import EmissionsTracker
-from datasets import load_dataset
 from torch.utils.data import DataLoader
-import os
 from tqdm import tqdm
-import numpy as np
-import pandas as pd
 
+from utils.cli import add_common_bench_args, resolve_base_dir
+from utils.config import DIFFUSION_MODELS
+from utils.data import PromptOnlyCollate, load_sampled_dataset
+from utils.tracking import artifact_path, build_exp_id, make_tracker
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 def reformat_func(example):
+    return {"prompt": example["prompt"]}
 
-    question = example['prompt']
 
-    return {'prompt': question}
+def main(model_key, device_tag, num_samples, batch_size, exp_name, base_dir, hf_token):
+    model_cfg = DIFFUSION_MODELS[model_key]
+    exp_id = build_exp_id(exp_name, model_cfg.short_name, batch_size)
 
-# Custom dataset class
-class DiffusionDBDataset():
-    def __init__(self):
-        pass
+    dataset = load_sampled_dataset(model_cfg.dataset, num_samples, reformat_func)
 
-    def __call__(self,data):
-        text_batch = [element["prompt"] for element in data]
-
-        return text_batch
-    
-
-def main(exp_name, batch_size, model_name, base_dir = "output"):
-    exp_id = exp_name + "_{}_batch_{}".format(model_name[9:], batch_size)
-
-    model_path = "pretrained"
-    dataset_path = "dataset"
-    dataset = load_dataset("poloclub/diffusiondb", cache_dir=dataset_path)
-    column_names = dataset['train'].column_names
-
-    dataset_selected = dataset["train"].select(np.arange(50))
-
-    # Qualcom has different precision
-    pipe = DiffusionPipeline.from_pretrained(model_name,
-                                            torch_dtype=torch.float16,#  for full precisoin it would be float32 
-                                            cache_dir=model_path)
-    
+    pipe = DiffusionPipeline.from_pretrained(
+        model_cfg.checkpoint,
+        torch_dtype=torch.float16,
+        cache_dir="pretrained",
+        token=hf_token or None,
+    )
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to("cuda")
 
-    processed_dataset = dataset_selected.map(
-        lambda example: reformat_func(example),
-        batched=False,
-        remove_columns=column_names
-    )
-    train_dataset = DiffusionDBDataset()
-    # Create a dataloader
-
-    cuda_device = os.getenv("CUDA_VISIBLE_DEVICES")
-    print("CPU allocated : ", cuda_device)
-
-
-    train_dataloader = DataLoader(
-        dataset=processed_dataset,
+    dataloader = DataLoader(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=train_dataset
+        collate_fn=PromptOnlyCollate(),
     )
 
+    prompt_log = []
     count = 0
-    prompt_list = []
-    for index, (prompts) in enumerate(tqdm(train_dataloader)):
-        prompt_list += [prompts]
-        with EmissionsTracker(project_name = exp_id, output_file = base_dir+"/emissions_A100{}.csv".format(exp_id), log_level="error", gpu_ids=cuda_device) as tracker:
-            generated_image = pipe(prompts).images[0]
+    for prompts in tqdm(dataloader):
+        prompt_log += prompts
+        with make_tracker(exp_id, base_dir, device_tag):
+            generated_images = pipe(prompts).images
+        for image in generated_images:
+            image.save(artifact_path(base_dir, f"{model_cfg.key}_image_{count}.png", subdir="images"))
+            count += 1
 
-        generated_image.save("stable_diff_v15_image_"+str(count)+".png")
-        count+=1
-    prompt_list = pd.DataFrame(prompt_list)
-    prompt_list.to_csv("stable_diff_v15_prompt_list.csv")
-
+    prompt_csv = artifact_path(base_dir, f"{model_cfg.key}_prompt_list.csv")
+    pd.DataFrame({"Prompt": prompt_log}).to_csv(prompt_csv, index=False)
 
 
 if __name__ == "__main__":
-    exp_name   = "exGenImage"
-    model_name = "runwayml/stable-diffusion-v1-5"
-    batch_size = 1
-    base_dir   = "output/exGenImage"
-    os.makedirs(base_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True, choices=sorted(DIFFUSION_MODELS),
+                         help="Which diffusion model to profile.")
+    add_common_bench_args(parser, default_exp_name="exGenImage")
+    args = parser.parse_args()
 
-    main(exp_name, batch_size, model_name, base_dir=base_dir)
+    main(
+        model_key=args.model,
+        device_tag=args.device_tag,
+        num_samples=args.num_samples,
+        batch_size=args.batch_size,
+        exp_name=args.exp_name,
+        base_dir=resolve_base_dir(args),
+        hf_token=args.hf_token,
+    )

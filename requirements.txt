@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+diffusers
+transformers==4.38.1
+datasets==2.17.0
+accelerate==0.27.1
+codecarbon
+pandas
+numpy
+tqdm
+Pillow
+opencv-python

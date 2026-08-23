@@ -1,0 +1,11 @@
+output/
+dataset/
+pretrained/
+*.png
+*.csv
+*.pth
+__pycache__/
+.ipynb_checkpoints/
+*.egg-info/
+.DS_Store
+.env
